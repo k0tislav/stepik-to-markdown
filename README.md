@@ -9,7 +9,13 @@
 
 С помощью данного скрипта мне удалось уменьшить размер файла и количество потраченных токенов **примерно в 40—60 раз**.
 
+<img width="598" height="57" alt="image" src="https://github.com/user-attachments/assets/c1e05a35-3606-4f7c-b0b8-7afbae1ca637" />
+
 Думай.Те
+
+<img width="1899" height="901" alt="3232323" src="https://github.com/user-attachments/assets/0acebe2c-9619-4e35-aa3d-97c9421d0b48" />
+
+
 
 Имеет два исполнения в виде скрипта для Tampermonkey и в виде расширения для браузера.
 
