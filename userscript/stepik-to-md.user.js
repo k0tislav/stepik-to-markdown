@@ -1,12 +1,18 @@
 // ==UserScript==
-// @name         Stepik Lesson & Course to Markdown (Universal)
-// @namespace    http://tampermonkey.net/
-// @version      4.3
-// @description  Export a Stepik lesson, single module, or full course to clean Markdown for LLMs (strictly read-only GET API)
-// @match        https://stepik.org/*
-// @match        https://*.stepik.org/*
-// @grant        GM_setClipboard
-// @run-at       document-idle
+// @name            Stepik Lesson & Course to Markdown (Universal)
+// @name:ru         Stepik в Markdown — скачивание курсов и уроков
+// @namespace       https://github.com/k0tislav/stepik-to-markdown
+// @version         2.0
+// @description     Export a Stepik lesson, single module, or full course to clean Markdown for LLMs (strictly read-only GET API)
+// @description:ru  Экспорт курсов, модулей и уроков со Stepik в чистый формат Markdown (.md) для нейросетей и конспектов
+// @author          k0tislav
+// @license         MIT
+// @homepageURL     https://github.com/k0tislav/stepik-to-markdown
+// @match           https://stepik.org/*
+// @match           https://*.stepik.org/*
+// @icon            https://stepik.org/favicon.ico
+// @grant           GM_setClipboard
+// @run-at          document-idle
 // ==/UserScript==
 
 (function () {
