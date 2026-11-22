@@ -1,3 +1,4 @@
+![Vibe Coded with Gemini](https://img.shields.io/badge/Vibe_Coded_with-Gemini_4_Neon-8E75B2?style=flat&logo=googlegemini&logoColor=white)
 # Stepik to Markdown
 
 Скрипт/расширение для экспорта любого урока со Stepik в формат Markdown (`.md`).
@@ -33,8 +34,8 @@
 ## Способ 2: Скрипт для Tampermonkey / Violentmonkey (подходит также для Firefox и Safari)
 
 1. Установите расширение **Tampermonkey** или **Violentmonkey** для вашего браузера.
-   * *Для браузеров на базе Chromium (Chrome, Edge, Яндекс) обязательно включите **«Режим разработчика»** на странице расширений браузера, иначе менеджер скриптов не сможет запускаться на страницах.*
-2. Откройте файл [`userscript/stepik-to-md.user.js`](userscript/stepik-to-md.user.js) в этом репозитории и нажмите кнопку **Raw** (или скопируйте его содержимое и вставьте в новый скрипт в панели Tampermonkey, нажав `Ctrl + S`).
+   * *Для браузеров на базе Chromium обязательно включите **«Режим разработчика»** на странице расширений браузера, иначе менеджер скриптов не сможет запускаться на страницах.*
+2. Откройте файл [`userscript/stepik-to-md.user.js`](userscript/stepik-to-md.user.js) в этом репозитории и нажмите кнопку **Raw**. Или создайте свой скрипт в Tampermonkey, вставив туда содержимое `userscript/stepik-to-md.user.js`. Убедитесь что разрешили Allow User Scripts в настройках расширения.
 3. Обновите (`F5`) страницу урока на Stepik.
 
 ---
