@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Stepik Lesson to Markdown",
-  "version": "3.0.0",
-  "description": "Экспорт любого урока Stepik в чистый и компактный Markdown для LLM (в буфер обмена или .md файл).",
+  "version": "2.0",
+  "description": "Экспорт курсов и уроков Stepik в чистый и компактный Markdown для LLM (в буфер обмена или .md файл).",
   "content_scripts": [
     {
       "matches": [
