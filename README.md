@@ -13,13 +13,13 @@
 Если сохранить урок со Stepik как обычный `.html` или `.mhtml` и загрузить его в LLM для конспекта или обучения, вы быстро упрётесь в лимиты контекстного окна: сырая страница содержит мегабайты скриптов, стилей и разметки сайта. **Stepik to Markdown** забирает контент напрямую через read-only GET API Stepik и очищает его в компактный Markdown.
 
 <p align="center">
-  <img width="598" height="57" alt="Сравнение размера .md и .mhtml файла урока Stepik" src="https://github.com/user-attachments/assets/c1e05a35-4f7c-4f8a-b0b8-7afbae1ca637" />
+  <img width="598" height="57" alt="Сравнение размера .md и .mhtml файла урока Stepik" src="https://github.com/user-attachments/assets/c1e05a35-3606-4f7c-b0b8-7afbae1ca637" />
   <br>
   Для сравнения — урок в формате <code>.md</code> весит в среднем <strong>в 40—60 раз меньше</strong>, чем тот же HTML-файл.
 </p>
 
 <p align="center">
-  <img width="389" height="61" alt="Кнопка MD в шапке урока Stepik" src="https://github.com/user-attachments/assets/f905f482-c17c-4f8a-b1fe-8fa6228d0ccb" />
+  <img width="389" height="61" alt="Кнопка MD в шапке урока Stepik" src="https://github.com/user-attachments/assets/f905f482-c17c-40bf-afbd-8fa6228d0ccb" />
   <br>
   Кнопка <code>MD</code> для экспорта сверху справа в хедере.
 </p>
@@ -27,7 +27,7 @@
 <details>
 <summary>Пример итогового Markdown (.md) на выходе</summary>
 
-```markdown
+````markdown
 # Целочисленная арифметика. Часть 1
 *Курс: "Поколение Python": курс для начинающих*
 
@@ -54,7 +54,7 @@
 Выход:
 6
 ```
-```
+````
 
 </details>
 
