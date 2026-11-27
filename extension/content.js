@@ -11,12 +11,19 @@
     'area', 'base', 'col', 'embed', 'hr', 'img', 'input',
     'link', 'meta', 'param', 'source', 'track', 'wbr'
   ]);
+  const STEPIK_ORIGIN = 'https://stepik.org';
+  const LESSON_PATH_RE = /\/lesson\/(?:[^/]+-)?(\d+)/;
+  const COURSE_PATH_RE = /\/course\/(?:[^/]+-)?(\d+)/;
+  const INLINE_HTML_TAG_RE = /(^|[\s([{"'«,:;>])(<!--[\s\S]*?-->|<!DOCTYPE\b[^>]*>|<\/?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+(?:[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?\s*)*)?\/?>)/g;
+  const DEFAULT_REQUEST_TIMEOUT_MS = 25000;
 
   let activeExportAbort = null;
   let activeExportKind = null; // 'module' | 'course' | null
   let lastExportStatus = null; // { text, state }
   let isLessonBusy = false;
+  let lessonResetTimer = null;
   let statusResetTimer = null;
+  let globalRateLimitUntil = 0;
   let syncRafPending = false;
   let lastObservedHref = window.location.href;
   let observedHeaderEl = null;
@@ -70,17 +77,44 @@
     if (JUNK_LANGS.has(l)) return '';
     if (/^python/.test(l)) return 'python';
     if (/^(c\+\+|cpp)/.test(l)) return 'cpp';
-    if (/^(c#|csharp)/.test(l)) return 'csharp';
+    if (/^(?:mono\s+)?(c#|csharp)/.test(l)) return 'csharp';
     if (/^(sh|shell|bash|zsh)/.test(l)) return 'bash';
     if (/^(js|javascript|node)/.test(l)) return 'javascript';
     if (/^(ts|typescript)/.test(l)) return 'typescript';
     if (/^(postgres|mysql|sqlite|sql)/.test(l)) return 'sql';
-    if (/^java\b/.test(l)) return 'java';
+    if (/^java(?:\d|\b)/.test(l)) return 'java';
     if (/^kotlin/.test(l)) return 'kotlin';
+    if (/^haskell/.test(l)) return 'haskell';
     if (/^rust/.test(l)) return 'rust';
-    if (/^go/.test(l)) return 'go';
-    return l.replace(/[\d.]+$/, '') || l;
+    if (/^go(?:\d|\b)/.test(l)) return 'go';
+    if (/^asm/.test(l)) return 'asm';
+    return l.replace(/[\s\d.]+$/, '') || l;
   };
+
+  function resolveStepikUrl(url) {
+    const trimmed = (url || '').trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('//')) return `https:${trimmed}`;
+    if (trimmed.startsWith('/')) return `${STEPIK_ORIGIN}${trimmed}`;
+    return trimmed;
+  }
+
+  function escapeMdUrl(url) {
+    return url.replace(/ /g, '%20').replace(/\(/g, '%28').replace(/\)/g, '%29');
+  }
+
+  function escapeHtmlAttr(val) {
+    return String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function protectInlineHtmlTags(text, pushInlineCode) {
+    if (!text || !text.includes('<')) return text;
+    return text.replace(INLINE_HTML_TAG_RE, (full, lead, tag) => `${lead}${pushInlineCode(tag)}`);
+  }
 
   function makeFence(code, lang = '') {
     const runs = code.match(/`{3,}/g);
@@ -190,11 +224,15 @@
     if (tag === 'pre' || tag === 'code') {
       return Array.from(node.childNodes).map(serializePreNode).join('');
     }
-    if (tag === 'span' && /\b(hljs|token|cm-|ace_|line-number)/.test(node.className || '')) {
+    if (
+      tag === 'span' &&
+      !node.hasAttribute('style') &&
+      /\b(hljs|token|cm-|ace_|line-number)/.test(node.className || '')
+    ) {
       return Array.from(node.childNodes).map(serializePreNode).join('');
     }
     const attrs = Array.from(node.attributes)
-      .map((a) => ` ${a.name}="${a.value}"`)
+      .map((a) => ` ${a.name}="${escapeHtmlAttr(a.value)}"`)
       .join('');
     if (VOID_HTML_TAGS.has(tag)) return `<${tag}${attrs}>`;
     const inner = Array.from(node.childNodes).map(serializePreNode).join('');
@@ -210,29 +248,93 @@
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const root = doc.body;
 
-    root.querySelectorAll('.copy-code-btn, script:not([type^="math/tex"]), style, noscript').forEach((el) => el.remove());
+    // Remove Stepik UI copy buttons before extracting code blocks
+    root.querySelectorAll('.copy-code-btn').forEach((el) => el.remove());
 
-    root.querySelectorAll('iframe').forEach((frame) => {
-      const src = (frame.getAttribute('src') || '').trim();
-      if (src) {
-        const title = cleanText(frame.getAttribute('title') || 'Embedded media').trim();
-        frame.replaceWith(`\n[${title}](${src})\n`);
-      } else {
-        frame.remove();
-      }
-    });
+    const TOK = '\uE000';
+    const END = '\uE001';
+    const makeTok = (kind, idx) => `${TOK}${kind}_${idx}${END}`;
 
-    // 1. Code blocks <pre> (serialize children only, preserving literal unescaped tags & blank lines)
     const codeBlocks = [];
+    const mathBlocks = [];
+    const inlineCodes = [];
+    const subSupBlocks = [];
+    const tableBlocks = [];
+    const listBlocks = [];
+    const quoteBlocks = [];
+
+    const pushInlineCode = (rawText) => {
+      const token = makeTok('ICODE', inlineCodes.length);
+      inlineCodes.push(rawText ? wrapInlineCode(rawText) : '');
+      return token;
+    };
+
+    const restoreTokens = (str, opts = {}) => {
+      let out = str;
+      quoteBlocks.forEach((b, i) => { out = out.replaceAll(makeTok('QUOTE', i), () => b); });
+      listBlocks.forEach((b, i) => { out = out.replaceAll(makeTok('LIST', i), () => b); });
+      tableBlocks.forEach((b, i) => { out = out.replaceAll(makeTok('TBL', i), () => b); });
+      if (!opts.skipBlockCode) {
+        codeBlocks.forEach((block, i) => {
+          const token = makeTok('CODE', i);
+          if (!out.includes(token)) return;
+          if (block.inline) {
+            out = out.replaceAll(token, () => block.content);
+            return;
+          }
+          const lineRe = new RegExp(`^([ \\t]*)(.*)${token}(.*)$`, 'gm');
+          out = out.replace(lineRe, (_, leadIndent, before, after) => {
+            const listMatch = before.match(/^((?:[*+-]|\d+\.)[ \t]+)(.*)$/);
+            if (listMatch) {
+              const markerPart = listMatch[1];
+              const textBefore = listMatch[2].trim();
+              const contIndent = leadIndent + ' '.repeat(markerPart.length);
+              const indentedFence = block.content
+                .split('\n')
+                .map((l) => (l.length ? `${contIndent}${l}` : ''))
+                .join('\n');
+              const tail = after.trim() ? `\n${contIndent}${after.trim()}` : '';
+              if (textBefore) {
+                return `${leadIndent}${markerPart}${textBefore}\n${indentedFence}${tail}`;
+              }
+              return `${leadIndent}${markerPart.trimEnd()}\n${indentedFence}${tail}`;
+            }
+
+            if (leadIndent && !before.trim() && !after.trim()) {
+              return block.content
+                .split('\n')
+                .map((l) => (l.length ? `${leadIndent}${l}` : ''))
+                .join('\n');
+            }
+
+            const prePart = before.trim() ? `${leadIndent}${before.trim()}\n\n` : '\n';
+            const postPart = after.trim() ? `\n\n${leadIndent}${after.trim()}` : '\n';
+            return `${prePart}${block.content}${postPart}`;
+          });
+        });
+      }
+      mathBlocks.forEach((b, i) => { out = out.replaceAll(makeTok('MATH', i), () => b); });
+      inlineCodes.forEach((b, i) => { out = out.replaceAll(makeTok('ICODE', i), () => b); });
+      subSupBlocks.forEach((b, i) => { out = out.replaceAll(makeTok('SUB', i), () => b); });
+      return out;
+    };
+
+    // 1. Extract <pre> BEFORE removing <script>/<style>/<iframe> so unescaped HTML/CSS/JS examples stay intact
     root.querySelectorAll('pre').forEach((pre) => {
+      if (!pre.isConnected) return;
       const codeEl = pre.querySelector('code');
-      const cls = `${codeEl?.className || ''} ${pre.className || ''}`;
+      const cls = [
+        codeEl?.className || '',
+        codeEl?.getAttribute('data-language') || '',
+        pre.className || '',
+        pre.getAttribute('data-language') || ''
+      ].join(' ');
       const langMatch = cls.match(/(?:language|lang)-([a-zA-Z0-9_+#.-]+)/);
       const lang = langMatch ? normalizeLang(langMatch[1]) : '';
       const rawCode = cleanText(serializePreChildren(pre))
         .replace(/\r\n?/g, '\n')
         .replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, '');
-      const token = `___CODE_BLOCK_${codeBlocks.length}___`;
+      const token = makeTok('CODE', codeBlocks.length);
       const inTable = Boolean(pre.closest('td, th'));
       codeBlocks.push({
         inline: inTable,
@@ -241,15 +343,52 @@
       pre.replaceWith(inTable ? token : `\n${token}\n`);
     });
 
-    // 2. LaTeX math
-    const mathBlocks = [];
+    // 2. Extract inline <code> BEFORE removing <script>/<style> so <code><style></code> or <code><br></code> stays intact
+    root.querySelectorAll('code').forEach((c) => {
+      if (!c.isConnected) return;
+      const txt = cleanText(serializePreChildren(c)).replace(/\r\n?/g, '\n').replace(/\n+/g, ' ');
+      c.replaceWith(pushInlineCode(txt));
+    });
+
+    // 3. Remove non-math scripts, styles, noscript outside code blocks
+    root.querySelectorAll('script:not([type^="math/tex"]), style, noscript').forEach((el) => el.remove());
+
+    // 4. Embedded iframes, video, audio inside text blocks
+    root.querySelectorAll('iframe').forEach((frame) => {
+      const src = resolveStepikUrl(frame.getAttribute('src'));
+      if (src) {
+        const title = cleanText(frame.getAttribute('title') || 'Embedded media').trim();
+        frame.replaceWith(`\n[${title}](${escapeMdUrl(src)})\n`);
+      } else {
+        frame.remove();
+      }
+    });
+
+    root.querySelectorAll('video, audio').forEach((mediaEl) => {
+      const rawSrc =
+        mediaEl.getAttribute('src') ||
+        mediaEl.querySelector('source[src]')?.getAttribute('src') ||
+        '';
+      const src = resolveStepikUrl(rawSrc);
+      if (src) {
+        const label = mediaEl.tagName === 'AUDIO' ? 'Audio' : 'Video';
+        mediaEl.replaceWith(`\n[${label}](${escapeMdUrl(src)})\n`);
+      } else {
+        mediaEl.remove();
+      }
+    });
+
+    // 5. LaTeX math
     root.querySelectorAll('.math-tex, script[type^="math/tex"]').forEach((el) => {
-      const tex = cleanText(el.textContent).trim();
+      let tex = cleanText(el.textContent).trim();
       if (!tex) {
         el.remove();
         return;
       }
       const inInlineOnly = Boolean(el.closest('td, th, li'));
+      if (inInlineOnly) {
+        tex = tex.replace(/\s*\n+\s*/g, ' ');
+      }
       let formatted;
       if (tex.startsWith('\\[') && tex.endsWith('\\]')) {
         const inner = tex.slice(2, -2).trim();
@@ -266,162 +405,76 @@
       } else {
         formatted = `$${tex}$`;
       }
-      const token = `___MATH_BLOCK_${mathBlocks.length}___`;
+      const token = makeTok('MATH', mathBlocks.length);
       mathBlocks.push(formatted);
       el.replaceWith(token);
     });
 
-    // 3. Inline code
-    const inlineCodes = [];
-    root.querySelectorAll('code').forEach((c) => {
-      const txt = cleanText(c.textContent);
-      const token = `___INLINE_CODE_${inlineCodes.length}___`;
-      inlineCodes.push(txt ? wrapInlineCode(txt) : '');
-      c.replaceWith(token);
-    });
-
-    // 4. Superscript / subscript
-    const subSupBlocks = [];
-    Array.from(root.querySelectorAll('sup, sub'))
-      .reverse()
-      .forEach((el) => {
-        const txt = cleanText(el.textContent).trim();
-        if (!txt) {
-          el.remove();
-          return;
-        }
-        const tag = el.tagName.toLowerCase();
-        const token = `___SUBSUP_${subSupBlocks.length}___`;
-        subSupBlocks.push(`<${tag}>${txt}</${tag}>`);
-        el.replaceWith(token);
-      });
-
-    // 5. Images
-    root.querySelectorAll('img').forEach((img) => {
-      const src = (img.getAttribute('src') || '').trim();
-      if (!src) {
-        img.remove();
-        return;
+    // 6. Protect HTML/CSS tag literals decoded from &lt;...&gt; entities in prose text nodes
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let currNode;
+    while ((currNode = walker.nextNode())) {
+      textNodes.push(currNode);
+    }
+    for (const tNode of textNodes) {
+      if (tNode.nodeValue && tNode.nodeValue.includes('<')) {
+        tNode.nodeValue = protectInlineHtmlTags(tNode.nodeValue, pushInlineCode);
       }
-      const alt = cleanText(img.getAttribute('alt') || img.getAttribute('title') || '').trim();
-      const inTable = Boolean(img.closest('td, th'));
-      img.replaceWith(inTable ? `![${alt}](${src})` : `\n![${alt}](${src})\n`);
-    });
+    }
 
-    // 6. Inline formatting (escape boundary asterisks to avoid ***.co** / *****)
-    const wrapInline = (selector, marker) => {
-      Array.from(root.querySelectorAll(selector))
-        .reverse()
-        .forEach((el) => {
-          const raw = cleanText(el.textContent);
-          const lead = raw.match(/^\s*/)[0];
-          const trail = raw.match(/\s*$/)[0];
-          let txt = raw.trim();
-          if (!txt) {
-            el.replaceWith(raw);
-            return;
-          }
-          if (marker.includes('*') && (txt.startsWith('*') || txt.endsWith('*'))) {
-            txt = txt.replace(/^\*+|\*+$/g, (m) => '\\*'.repeat(m.length));
-          }
-          el.replaceWith(`${lead}${marker}${txt}${marker}${trail}`);
-        });
+    const headingEls = Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+    const lowestHeading = headingEls.length
+      ? Math.min(...headingEls.map((h) => Number(h.tagName.slice(1))))
+      : 1;
+
+    const EM_START = `${TOK}M1${END}`;
+    const STRONG_START = `${TOK}M2${END}`;
+
+    const wrapMdInline = (el, tokMarker, ctx) => {
+      const raw = cleanText(serializeChildren(el, ctx));
+      const lead = raw.match(/^\s*/)[0];
+      const trail = raw.match(/\s*$/)[0];
+      let txt = raw.trim();
+      if (!txt) return raw;
+      if (txt.startsWith('*') || txt.endsWith('*')) {
+        txt = txt.replace(/^\*+|\*+$/g, (m) => '\\*'.repeat(m.length));
+      }
+      return `${lead}${tokMarker}${txt}${tokMarker}${trail}`;
     };
 
-    wrapInline('em, i', '*');
-    wrapInline('strong, b', '**');
-    wrapInline('del, s, strike', '~~');
-
-    Array.from(root.querySelectorAll('a'))
-      .reverse()
-      .forEach((a) => {
-        const href = (a.getAttribute('href') || '').trim();
-        const raw = cleanText(a.textContent);
-        const lead = raw.match(/^\s*/)[0];
-        const trail = raw.match(/\s*$/)[0];
-        const txt = raw.trim();
-        if (!href) {
-          a.replaceWith(raw);
-        } else if (!txt || txt === href) {
-          a.replaceWith(`${lead}${href}${trail}`);
-        } else {
-          a.replaceWith(`${lead}[${txt}](${href})${trail}`);
-        }
-      });
-
-    // 7. Tables
-    const tableBlocks = [];
-    root.querySelectorAll('table').forEach((table) => {
-      const rows = Array.from(table.querySelectorAll('tr'))
+    const serializeTable = (table, ctx) => {
+      const ownRows = Array.from(table.querySelectorAll('tr')).filter(
+        (tr) => tr.closest('table') === table
+      );
+      const rows = ownRows
         .map((tr) =>
-          Array.from(tr.querySelectorAll('th, td')).map((cell) => {
-            cell.querySelectorAll('br').forEach((br) => br.replaceWith(' '));
-            return cleanText(cell.textContent)
-              .replace(/\s*\n+\s*/g, ' ')
-              .replace(/[ \t]{2,}/g, ' ')
-              .replace(/\|/g, '\\|')
-              .trim();
-          })
+          Array.from(tr.children)
+            .filter((cell) => cell.tagName === 'TD' || cell.tagName === 'TH')
+            .map((cell) => {
+              const rawCell = cleanText(serializeChildren(cell, { ...ctx, inTable: true }));
+              const resolved = restoreTokens(rawCell)
+                .replaceAll(EM_START, '*')
+                .replaceAll(STRONG_START, '**');
+              return resolved
+                .replace(/\s*\n+\s*/g, ' ')
+                .replace(/[ \t]{2,}/g, ' ')
+                .replace(/\\\|/g, '|')
+                .replace(/\|/g, '\\|')
+                .trim();
+            })
         )
         .filter((r) => r.length > 0);
 
-      if (rows.length > 0) {
-        const cols = Math.max(...rows.map((r) => r.length));
-        const pad = (r) => [...r, ...Array(cols - r.length).fill('')];
-        const header = `| ${pad(rows[0]).join(' | ')} |`;
-        const sep = `| ${Array(cols).fill('---').join(' | ')} |`;
-        const body = rows.slice(1).map((r) => `| ${pad(r).join(' | ')} |`).join('\n');
-        const token = `___TABLE_BLOCK_${tableBlocks.length}___`;
-        tableBlocks.push(`\n${header}\n${sep}${body ? `\n${body}` : ''}\n`);
-        table.replaceWith(token);
-      } else {
-        table.remove();
-      }
-    });
-
-    // 8. Details/summary, headings (shifted under step heading), blockquotes, hr
-    root.querySelectorAll('summary').forEach((s) => {
-      const txt = cleanText(s.textContent).replace(/\*\*/g, '').replace(/[ \t]{2,}/g, ' ').trim();
-      s.replaceWith(txt ? `\n**${txt}**\n` : '\n');
-    });
-
-    const headingEls = Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6'));
-    if (headingEls.length > 0) {
-      const lowestFound = Math.min(...headingEls.map((h) => Number(h.tagName.slice(1))));
-      headingEls.forEach((h) => {
-        const orig = Number(h.tagName.slice(1));
-        const shifted = Math.min(6, Math.max(orig, minHeadingLevel + (orig - lowestFound)));
-        const txt = cleanText(h.textContent).replace(/\s+/g, ' ').trim();
-        h.replaceWith(txt ? `\n${'#'.repeat(shifted)} ${txt}\n` : '');
-      });
-    }
-
-    root.querySelectorAll('blockquote').forEach((bq) => {
-      bq.querySelectorAll('br').forEach((br) => {
-        if (br.nextSibling?.nodeType === Node.TEXT_NODE) {
-          br.nextSibling.nodeValue = br.nextSibling.nodeValue.replace(/^[ \t]*\r?\n/, '');
-        }
-        br.replaceWith('\n');
-      });
-      const lines = cleanText(bq.textContent)
-        .replace(/\r\n?/g, '\n')
-        .trim()
-        .split('\n')
-        .map((l) => `> ${l.replace(/[ \t]{2,}/g, ' ').trim()}`)
-        .join('\n');
-      bq.replaceWith(lines ? `\n${lines}\n` : '');
-    });
-
-    root.querySelectorAll('hr').forEach((hr) => hr.replaceWith('\n---\n'));
-
-    // 9. Nested lists (document-order traversal preserving mid-item sublists, paragraphs & code blocks)
-    const listBlocks = [];
-
-    const extractInlineText = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) return cleanText(node.nodeValue || '');
-      if (node.nodeType !== Node.ELEMENT_NODE) return '';
-      if (node.tagName === 'BR') return '\n';
-      return Array.from(node.childNodes).map(extractInlineText).join('');
+      if (!rows.length) return '';
+      const cols = Math.max(...rows.map((r) => r.length));
+      const pad = (r) => [...r, ...Array(cols - r.length).fill('')];
+      const header = `| ${pad(rows[0]).join(' | ')} |`;
+      const sep = `| ${Array(cols).fill('---').join(' | ')} |`;
+      const body = rows.slice(1).map((r) => `| ${pad(r).join(' | ')} |`).join('\n');
+      const token = makeTok('TBL', tableBlocks.length);
+      tableBlocks.push(`\n${header}\n${sep}${body ? `\n${body}` : ''}\n`);
+      return `\n${token}\n`;
     };
 
     const normalizeListParagraph = (raw) =>
@@ -431,7 +484,7 @@
         .map((line) => line.replace(/[ \t]{2,}/g, ' ').trim())
         .filter(Boolean);
 
-    const renderList = (listEl, indent = '') => {
+    const renderList = (listEl, indent = '', ctx = {}) => {
       const isOrdered = listEl.tagName === 'OL';
       let index = Number(listEl.getAttribute('start')) || 1;
       const outLines = [];
@@ -460,19 +513,27 @@
           const tag = node.tagName;
           if (tag === 'UL' || tag === 'OL') {
             flushInline();
-            const sub = renderList(node, childIndent);
+            const sub = renderList(node, childIndent, ctx);
             if (sub) segments.push({ type: 'list', content: sub });
-          } else if (tag === 'P' || tag === 'DIV' || tag === 'BLOCKQUOTE') {
+          } else if (tag === 'BLOCKQUOTE' || tag === 'DETAILS') {
             flushInline();
-            if (node.querySelector('ul, ol')) {
+            const rendered = serializeElement(node, ctx).trim();
+            if (rendered) segments.push({ type: 'text', content: rendered });
+          } else if (tag === 'P' || tag === 'DIV') {
+            flushInline();
+            if (node.querySelector('ul, ol, blockquote, details, table')) {
               Array.from(node.childNodes).forEach(walkLiChild);
               flushInline();
             } else {
-              inlineBuf += extractInlineText(node);
+              inlineBuf += serializeChildren(node, ctx);
               flushInline();
             }
+          } else if (tag === 'TABLE') {
+            flushInline();
+            const tbl = serializeTable(node, ctx).trim();
+            if (tbl) segments.push({ type: 'text', content: tbl });
           } else {
-            inlineBuf += extractInlineText(node);
+            inlineBuf += serializeElement(node, ctx);
           }
         };
 
@@ -482,6 +543,7 @@
         if (!segments.length) return;
 
         let emittedMarker = false;
+        const codeTokenRe = new RegExp(`^${TOK}CODE_\\d+${END}$`);
         for (const seg of segments) {
           if (seg.type === 'list') {
             if (!emittedMarker) {
@@ -495,7 +557,7 @@
           let text = seg.content;
           if (!emittedMarker) {
             text = text.replace(/^[·•▪◦]\s*/, '');
-            if (/^___CODE_BLOCK_\d+___$/.test(text)) {
+            if (codeTokenRe.test(text)) {
               outLines.push(`${indent}${marker}`);
               outLines.push(`${childIndent}${text}`);
             } else {
@@ -511,34 +573,146 @@
       return outLines.join('\n');
     };
 
-    root.querySelectorAll('ul, ol').forEach((list) => {
-      if (list.isConnected && !list.parentElement?.closest('ul, ol')) {
-        const rendered = renderList(list, '');
-        if (rendered) {
-          const token = `___LIST_BLOCK_${listBlocks.length}___`;
-          listBlocks.push(`\n${rendered}\n`);
-          list.replaceWith(token);
-        } else {
-          list.remove();
+    const formatBlockquoteString = (innerRaw) => {
+      let resolved = restoreTokens(innerRaw)
+        .replaceAll(EM_START, '*')
+        .replaceAll(STRONG_START, '**');
+      resolved = cleanText(resolved)
+        .replace(/\r\n?/g, '\n')
+        .replace(/^[ \t]+/gm, (m) => m) // keep code/list indentation inside blockquote
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      if (!resolved) return '';
+      const quoted = resolved
+        .split('\n')
+        .map((line) => {
+          const trimmedEnd = line.replace(/[ \t]+$/, '');
+          return trimmedEnd ? `> ${trimmedEnd}` : '>';
+        })
+        .join('\n');
+      const token = makeTok('QUOTE', quoteBlocks.length);
+      quoteBlocks.push(`\n${quoted}\n`);
+      return `\n${token}\n`;
+    };
+
+    const serializeChildren = (el, ctx = {}) =>
+      Array.from(el.childNodes)
+        .map((child) => serializeNode(child, ctx))
+        .join('');
+
+    const serializeNode = (node, ctx = {}) => {
+      if (node.nodeType === Node.TEXT_NODE) return cleanText(node.nodeValue || '');
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      return serializeElement(node, ctx);
+    };
+
+    const serializeElement = (el, ctx = {}) => {
+      const tag = el.tagName.toUpperCase();
+      if (tag === 'BR') {
+        if (el.nextSibling?.nodeType === Node.TEXT_NODE) {
+          el.nextSibling.nodeValue = el.nextSibling.nodeValue.replace(/^[ \t]*\r?\n/, '');
         }
+        return '\n';
       }
-    });
-
-    // 10. Line breaks & paragraphs (strip single trailing newline after <br>)
-    root.querySelectorAll('br').forEach((br) => {
-      if (br.nextSibling?.nodeType === Node.TEXT_NODE) {
-        br.nextSibling.nodeValue = br.nextSibling.nodeValue.replace(/^[ \t]*\r?\n/, '');
+      if (tag === 'HR') return '\n---\n';
+      if (tag === 'IMG') {
+        const src = resolveStepikUrl(el.getAttribute('src'));
+        if (!src) return '';
+        const alt = cleanText(el.getAttribute('alt') || el.getAttribute('title') || '')
+          .trim()
+          .replace(/[\[\]]/g, '\\$&');
+        return ctx.inTable
+          ? `![${alt}](${escapeMdUrl(src)})`
+          : `\n![${alt}](${escapeMdUrl(src)})\n`;
       }
-      br.replaceWith('\n');
-    });
+      if (tag === 'SUP' || tag === 'SUB') {
+        const inner = cleanText(serializeChildren(el, ctx)).trim();
+        if (!inner) return '';
+        const token = makeTok('SUB', subSupBlocks.length);
+        subSupBlocks.push(`<${tag.toLowerCase()}>${inner}</${tag.toLowerCase()}>`);
+        return token;
+      }
+      if (tag === 'EM' || tag === 'I') return wrapMdInline(el, EM_START, ctx);
+      if (tag === 'STRONG' || tag === 'B') return wrapMdInline(el, STRONG_START, ctx);
+      if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') return wrapMdInline(el, '~~', ctx);
+      if (tag === 'A') {
+        const href = resolveStepikUrl(el.getAttribute('href'));
+        const raw = serializeChildren(el, ctx);
+        const lead = raw.match(/^\s*/)[0];
+        const trail = raw.match(/\s*$/)[0];
+        const txt = raw.trim();
+        if (!href) return raw;
+        if (!txt || txt === href) return `${lead}${escapeMdUrl(href)}${trail}`;
+        return `${lead}[${txt}](${escapeMdUrl(href)})${trail}`;
+      }
+      if (/^H[1-6]$/.test(tag)) {
+        const orig = Number(tag.slice(1));
+        const shifted = Math.min(6, Math.max(orig, minHeadingLevel + (orig - lowestHeading)));
+        const txt = cleanText(serializeChildren(el, ctx))
+          .replace(/\s+/g, ' ')
+          .trim();
+        return txt ? `\n${'#'.repeat(shifted)} ${txt}\n` : '\n';
+      }
+      if (tag === 'SUMMARY') {
+        const txt = cleanText(serializeChildren(el, ctx))
+          .replaceAll(STRONG_START, '')
+          .replace(/\*\*/g, '')
+          .replace(/[ \t]{2,}/g, ' ')
+          .trim();
+        return txt ? `\n**${txt}**\n` : '\n';
+      }
+      if (tag === 'DETAILS') {
+        const summaryEl = Array.from(el.children).find((c) => c.tagName === 'SUMMARY');
+        const summaryTxt = summaryEl
+          ? cleanText(serializeChildren(summaryEl, ctx))
+              .replaceAll(STRONG_START, '')
+              .replace(/\*\*/g, '')
+              .replace(/\s+/g, ' ')
+              .trim()
+          : '';
+        const bodyRaw = Array.from(el.childNodes)
+          .filter((c) => c !== summaryEl)
+          .map((c) => serializeNode(c, ctx))
+          .join('');
+        const bodyResolved = normalizeBlankLines(
+          restoreTokens(bodyRaw).replaceAll(EM_START, '*').replaceAll(STRONG_START, '**')
+        );
+        const headingLine = `**${summaryTxt || 'Спойлер'}**`;
+        const combined = bodyResolved ? `${headingLine}\n\n${bodyResolved}` : headingLine;
+        return formatBlockquoteString(combined);
+      }
+      if (tag === 'BLOCKQUOTE') {
+        return formatBlockquoteString(serializeChildren(el, ctx));
+      }
+      if (tag === 'TABLE') {
+        return serializeTable(el, ctx);
+      }
+      if (tag === 'UL' || tag === 'OL') {
+        const rendered = renderList(el, '', ctx);
+        if (!rendered) return '';
+        const token = makeTok('LIST', listBlocks.length);
+        listBlocks.push(`\n${rendered}\n`);
+        return `\n${token}\n`;
+      }
+      if (
+        tag === 'P' ||
+        tag === 'DIV' ||
+        tag === 'SECTION' ||
+        tag === 'ARTICLE' ||
+        tag === 'HEADER' ||
+        tag === 'FOOTER' ||
+        tag === 'FIGURE' ||
+        tag === 'FIGCAPTION'
+      ) {
+        const inner = serializeChildren(el, ctx);
+        if (ctx.inTable) return ` ${inner} `;
+        return inner.trim() ? `\n${inner}\n` : '\n';
+      }
+      return serializeChildren(el, ctx);
+    };
 
-    root.querySelectorAll('p').forEach((p) => {
-      const txt = cleanText(p.textContent).trim();
-      p.replaceWith(txt ? `\n${txt}\n` : '\n');
-    });
-
-    // 11. Prose cleanup before restoring protected blocks
-    let result = cleanText(root.textContent)
+    const rawSerialized = cleanText(serializeChildren(root, {}));
+    let result = rawSerialized
       .replace(/\r\n?/g, '\n')
       .replace(/^[ \t]+/gm, '')
       .replace(/[ \t]+\n/g, '\n')
@@ -546,50 +720,9 @@
       .replace(/\n{3,}/g, '\n\n')
       .trim();
 
-    listBlocks.forEach((b, i) => { result = result.replace(`___LIST_BLOCK_${i}___`, () => b); });
-    tableBlocks.forEach((b, i) => { result = result.replace(`___TABLE_BLOCK_${i}___`, () => b); });
-
-    // Restore code blocks with indentation awareness for lists
-    codeBlocks.forEach((block, i) => {
-      const token = `___CODE_BLOCK_${i}___`;
-      if (block.inline) {
-        result = result.replace(token, () => block.content);
-        return;
-      }
-      const lineRe = new RegExp(`^([ \\t]*)(.*)${token}(.*)$`, 'm');
-      result = result.replace(lineRe, (_, leadIndent, before, after) => {
-        const listMatch = before.match(/^((?:[*+-]|\d+\.)[ \t]+)(.*)$/);
-        if (listMatch) {
-          const markerPart = listMatch[1];
-          const textBefore = listMatch[2].trim();
-          const contIndent = leadIndent + ' '.repeat(markerPart.length);
-          const indentedFence = block.content
-            .split('\n')
-            .map((l) => (l.length ? `${contIndent}${l}` : ''))
-            .join('\n');
-          const tail = after.trim() ? `\n${contIndent}${after.trim()}` : '';
-          if (textBefore) {
-            return `${leadIndent}${markerPart}${textBefore}\n${indentedFence}${tail}`;
-          }
-          return `${leadIndent}${markerPart.trimEnd()}\n${indentedFence}${tail}`;
-        }
-
-        if (leadIndent && !before.trim() && !after.trim()) {
-          return block.content
-            .split('\n')
-            .map((l) => (l.length ? `${leadIndent}${l}` : ''))
-            .join('\n');
-        }
-
-        const prePart = before.trim() ? `${leadIndent}${before.trim()}\n\n` : '\n';
-        const postPart = after.trim() ? `\n\n${leadIndent}${after.trim()}` : '\n';
-        return `${prePart}${block.content}${postPart}`;
-      });
-    });
-
-    mathBlocks.forEach((b, i) => { result = result.replace(`___MATH_BLOCK_${i}___`, () => b); });
-    inlineCodes.forEach((b, i) => { result = result.replace(`___INLINE_CODE_${i}___`, () => b); });
-    subSupBlocks.forEach((b, i) => { result = result.replace(`___SUBSUP_${i}___`, () => b); });
+    result = restoreTokens(result)
+      .replaceAll(EM_START, '*')
+      .replaceAll(STRONG_START, '**');
 
     return normalizeBlankLines(result);
   }
@@ -610,26 +743,107 @@
     return base + Math.floor(Math.random() * 500);
   }
 
-  async function fetchJsonWithRetry(url, { signal, onRateLimit } = {}, retries = 3) {
+  async function fetchJsonWithRetry(
+    url,
+    { signal, onRateLimit, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {},
+    retries = 4
+  ) {
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const res = await fetch(url, { method: 'GET', credentials: 'same-origin', signal });
-      if (res.status === 429) {
-        if (attempt === retries) throw new Error('HTTP 429: Stepik API rate limit exceeded');
-        const waitMs = parseRetryAfterMs(res.headers.get('Retry-After'), attempt);
-        if (onRateLimit) onRateLimit(Math.ceil(waitMs / 1000));
-        await sleep(waitMs, signal);
-        continue;
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      const now = Date.now();
+      if (globalRateLimitUntil > now) {
+        await sleep(globalRateLimitUntil - now, signal);
       }
-      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < retries) {
-        await sleep(1500 * (attempt + 1), signal);
-        continue;
+
+      const reqCtrl = new AbortController();
+      let timedOut = false;
+      const onParentAbort = () => reqCtrl.abort();
+      signal?.addEventListener('abort', onParentAbort, { once: true });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        reqCtrl.abort();
+      }, timeoutMs);
+
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          credentials: 'same-origin',
+          signal: reqCtrl.signal
+        });
+
+        if (res.status === 429) {
+          if (attempt === retries) {
+            const err = new Error('HTTP 429: Stepik API rate limit exceeded');
+            err.status = 429;
+            throw err;
+          }
+          const waitMs = parseRetryAfterMs(res.headers.get('Retry-After'), attempt);
+          globalRateLimitUntil = Math.max(globalRateLimitUntil, Date.now() + waitMs);
+          if (onRateLimit) onRateLimit(Math.ceil((globalRateLimitUntil - Date.now()) / 1000));
+          await sleep(Math.max(0, globalRateLimitUntil - Date.now()), signal);
+          continue;
+        }
+
+        if ((res.status === 408 || res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) && attempt < retries) {
+          await sleep(1500 * (attempt + 1) + Math.floor(Math.random() * 400), signal);
+          continue;
+        }
+
+        if (!res.ok) {
+          const err = new Error(`HTTP ${res.status} (${url})`);
+          err.status = res.status;
+          throw err;
+        }
+
+        return await res.json();
+      } catch (e) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const isRetryableNet = timedOut || e.name === 'TypeError' || e.name === 'AbortError';
+        if (isRetryableNet && attempt < retries) {
+          await sleep(1200 * (attempt + 1) + Math.floor(Math.random() * 400), signal);
+          continue;
+        }
+        if (timedOut) {
+          const err = new Error(`Request timeout (${url})`);
+          err.status = 408;
+          throw err;
+        }
+        throw e;
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onParentAbort);
       }
-      if (!res.ok) {
-        const err = new Error(`HTTP ${res.status} (${url})`);
-        err.status = res.status;
-        throw err;
+    }
+    throw new Error(`Exhausted retries (${url})`);
+  }
+
+  async function fetchIdChunkWithBisection(endpoint, resourceKey, chunk, opts) {
+    const query = chunk.map((id) => `ids[]=${id}`).join('&');
+    try {
+      const collected = [];
+      let page = 1;
+      while (true) {
+        const pageSuffix = page > 1 ? `&page=${page}` : '';
+        const data = await fetchJsonWithRetry(`/api/${endpoint}?${query}${pageSuffix}`, opts);
+        collected.push(...(data[resourceKey] || []));
+        if (!data.meta?.has_next) break;
+        page++;
       }
-      return res.json();
+      return collected;
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      if (opts.allowPartial && (e.status === 403 || e.status === 404)) {
+        if (chunk.length > 1) {
+          const mid = Math.ceil(chunk.length / 2);
+          const left = await fetchIdChunkWithBisection(endpoint, resourceKey, chunk.slice(0, mid), opts);
+          const right = await fetchIdChunkWithBisection(endpoint, resourceKey, chunk.slice(mid), opts);
+          return [...left, ...right];
+        }
+        console.warn(`[Stepik MD] Skipped restricted ${endpoint} id=${chunk[0]} (${e.status})`);
+        return [];
+      }
+      throw e;
     }
   }
 
@@ -638,18 +852,8 @@
     const results = [];
     for (let i = 0; i < uniqueIds.length; i += 50) {
       const chunk = uniqueIds.slice(i, i + 50);
-      const query = chunk.map((id) => `ids[]=${id}`).join('&');
-      try {
-        const data = await fetchJsonWithRetry(`/api/${endpoint}?${query}`, opts);
-        results.push(...(data[resourceKey] || []));
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        if (opts.allowPartial && (e.status === 403 || e.status === 404)) {
-          console.warn(`[Stepik MD] Skipped restricted ${endpoint} chunk (${e.status})`);
-        } else {
-          throw e;
-        }
-      }
+      const chunkItems = await fetchIdChunkWithBisection(endpoint, resourceKey, chunk, opts);
+      results.push(...chunkItems);
       if (opts.onChunk) {
         opts.onChunk(Math.min(i + 50, uniqueIds.length), uniqueIds.length);
       }
@@ -678,20 +882,86 @@
       const data = await fetchJsonWithRetry(`/api/attempts?step=${stepId}`, opts);
       const attempts = data.attempts || [];
       if (!attempts.length) return null;
-      const active = attempts.find((a) => a.status === 'active') || attempts[attempts.length - 1];
-      return active?.dataset || null;
+      const active =
+        attempts.find((a) => a.status === 'active') ||
+        attempts.reduce((best, cur) => ((cur.id || 0) >= (best?.id || 0) ? cur : best), attempts[0]);
+      if (active?.dataset && typeof active.dataset === 'object') {
+        return active.dataset;
+      }
+      if (active?.dataset_url) {
+        const dsUrl = resolveStepikUrl(active.dataset_url);
+        if (dsUrl.startsWith(STEPIK_ORIGIN) || dsUrl.startsWith('/')) {
+          return await fetchJsonWithRetry(dsUrl, opts);
+        }
+      }
+      return null;
     } catch (e) {
-      if (e.name === 'AbortError') throw e;
+      if (e.name === 'AbortError' || e.status === 429 || e.status === 401 || e.status === 403) {
+        throw e;
+      }
       return null;
     }
   }
 
   // --- Step Markdown Renderer ---
 
+  function decodeHtmlEntities(str) {
+    const doc = new DOMParser().parseFromString(str, 'text/html');
+    return cleanText(doc.body.textContent || '');
+  }
+
+  function looksLikeStandaloneHtmlSnippet(raw) {
+    if (!raw || /<[a-zA-Z!/]/.test(raw)) return false;
+    if (!/&lt;\/?[a-zA-Z!]/.test(raw)) return false;
+    const decoded = decodeHtmlEntities(raw).trim();
+    return decoded.startsWith('<') && decoded.endsWith('>') && /<\/?[a-zA-Z!]/.test(decoded);
+  }
+
+  function wrapTagTextIfNeeded(txt) {
+    if (!txt || !txt.includes('<')) return txt;
+    if (/^(?:<!--[\s\S]*-->|<!DOCTYPE\b[^>]*>|<\/?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?\/?>)$/.test(txt)) {
+      return wrapInlineCode(txt);
+    }
+    return txt.replace(INLINE_HTML_TAG_RE, (full, lead, tag) => `${lead}${wrapInlineCode(tag)}`);
+  }
+
   function renderOptionText(raw, isHtmlEnabled) {
     if (raw == null) return '';
-    if (isHtmlEnabled === false) return cleanText(String(raw)).trim();
-    return htmlToMd(String(raw)).replace(/\n+/g, ' ');
+    const str = String(raw);
+    if (isHtmlEnabled === false) {
+      return wrapTagTextIfNeeded(cleanText(str).trim());
+    }
+    if (looksLikeStandaloneHtmlSnippet(str)) {
+      return wrapInlineCode(decodeHtmlEntities(str).trim().replace(/\s*\n+\s*/g, ' '));
+    }
+    return htmlToMd(str).replace(/\n+/g, ' ');
+  }
+
+  function renderFillBlankText(raw, isHtmlEnabled) {
+    if (raw == null) return '';
+    const str = String(raw);
+    if (isHtmlEnabled === false) {
+      return wrapTagTextIfNeeded(cleanText(str).replace(/\r\n?/g, '\n'));
+    }
+    const parts = str.split(/<br\s*\/?>/gi);
+    return parts
+      .map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return '';
+        return htmlToMd(part).replace(/\n+/g, ' ');
+      })
+      .join('\n');
+  }
+
+  function isGenericCodeStub(tpl) {
+    const nonEmpty = tpl
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (!nonEmpty.length) return true;
+    return nonEmpty.every((line) =>
+      /^(?:\/\/|#|;;|--|%|\/\*|\*\/|<!--)\s*put your .*code here\s*(?:\*\/|-->)?$/i.test(line)
+    );
   }
 
   function needsAttemptDataset(step) {
@@ -700,7 +970,7 @@
     return INTERACTIVE_TYPES.has(t) && !o.options && !o.pairs && !o.rows && !o.components && !o.lines;
   }
 
-  function renderStepMarkdown(step, dataset, headingLevel = 2) {
+  function renderStepMarkdown(step, dataset, headingLevel = 2, { quizAbortedByRateLimit = false } = {}) {
     const block = step.block || {};
     const type = block.name || 'unknown';
     const opts = block.options || {};
@@ -714,35 +984,47 @@
       md += `*Ограничение попыток: ${step.max_submissions_count}*\n\n`;
     }
 
-    if (type === 'video' && block.video) {
-      const urls = [...(block.video.urls || [])].sort((a, b) => Number(b.quality) - Number(a.quality));
-      const best = urls[0];
-      const dur = formatDuration(block.video.duration);
-      const filename = cleanText(block.video.filename || '').trim();
+    if (type === 'video') {
+      if (block.video) {
+        const urls = [...(block.video.urls || [])].sort((a, b) => {
+          const qa = parseInt(a.quality, 10) || 0;
+          const qb = parseInt(b.quality, 10) || 0;
+          return qb - qa;
+        });
+        const best = urls[0];
+        const dur = formatDuration(block.video.duration);
+        const filename = cleanText(block.video.filename || '').trim();
 
-      if (best?.url) {
-        md += `*Видео (${best.quality}p${dur ? `, ${dur}` : ''}):* ${best.url}\n`;
+        if (best?.url) {
+          md += `*Видео (${best.quality}p${dur ? `, ${dur}` : ''}):* ${best.url}\n`;
+        } else {
+          md += `*Видео${dur ? ` (${dur})` : ''}*\n`;
+        }
+        if (/^https?:\/\//i.test(filename)) {
+          md += `*Источник:* ${filename}\n`;
+        } else if (filename && !/^video\./i.test(filename)) {
+          md += `*Файл:* ${filename}\n`;
+        }
+        if (Array.isArray(block.subtitle_files) && block.subtitle_files.length) {
+          const subs = block.subtitle_files
+            .map((sub) => (typeof sub === 'string' ? sub : sub?.url ? `${sub.language || 'sub'}: ${sub.url}` : ''))
+            .filter(Boolean);
+          if (subs.length) md += `*Субтитры:* ${subs.join(', ')}\n`;
+        }
+        md += '\n';
       } else {
-        md += `*Видео${dur ? ` (${dur})` : ''}*\n`;
+        md += `*Видео недоступно.*\n\n`;
       }
-      if (/^https?:\/\//i.test(filename)) {
-        md += `*Источник:* ${filename}\n`;
-      } else if (filename && !/^video\./i.test(filename)) {
-        md += `*Файл:* ${filename}\n`;
-      }
-      if (Array.isArray(block.subtitle_files) && block.subtitle_files.length) {
-        const subs = block.subtitle_files
-          .map((sub) => (typeof sub === 'string' ? sub : sub?.url ? `${sub.language || 'sub'}: ${sub.url}` : ''))
-          .filter(Boolean);
-        if (subs.length) md += `*Субтитры:* ${subs.join(', ')}\n`;
-      }
-      md += '\n';
     }
 
     if (block.text) {
       const bodyMd = htmlToMd(block.text, { minHeadingLevel: Math.min(6, headingLevel + 1) });
       if (bodyMd) md += `${bodyMd}\n\n`;
     }
+
+    const notLoadedReason = quizAbortedByRateLimit
+      ? 'не загружены (превышен лимит запросов Stepik API 429)'
+      : 'не загружены (попытка ещё не создавалась)';
 
     if (type === 'choice') {
       const options = ds.options || opts.options;
@@ -760,7 +1042,7 @@
         }
         md += '\n';
       } else {
-        md += `*Варианты ответа${mode ? ` (${mode})` : ''}: не загружены (попытка ещё не создавалась).*\n\n`;
+        md += `*Варианты ответа${mode ? ` (${mode})` : ''}: ${notLoadedReason}.*\n\n`;
       }
     }
 
@@ -778,7 +1060,7 @@
         });
         md += '\n';
       } else {
-        md += `*Пары для сопоставления не загружены (попытка ещё не создавалась).*\n\n`;
+        md += `*Пары для сопоставления ${notLoadedReason}.*\n\n`;
       }
     }
 
@@ -794,7 +1076,7 @@
         });
         md += '\n';
       } else {
-        md += `*Элементы для сортировки не загружены (попытка ещё не создавалась).*\n\n`;
+        md += `*Элементы для сортировки ${notLoadedReason}.*\n\n`;
       }
     }
 
@@ -812,7 +1094,7 @@
         }
         md += '\n';
       } else {
-        md += `*Таблица выбора не загружена (попытка ещё не создавалась).*\n\n`;
+        md += `*Таблица выбора ${notLoadedReason}.*\n\n`;
       }
     }
 
@@ -820,16 +1102,49 @@
       const components = ds.components || opts.components;
       if (components?.length) {
         md += `**Шаблон с пропусками${ds.is_case_sensitive ? ' (учитывается регистр)' : ''}:**\n`;
-        const line = components
-          .map((c) => {
-            if (c.type === 'text') return renderOptionText(c.text, isHtmlEnabled);
-            if (c.type === 'select') return `[Выбор: ${(c.options || []).map((o) => cleanText(o)).join(' / ')}]`;
-            return '[____]';
-          })
-          .join(' ');
-        md += `${line}\n\n`;
+        const parts = components.map((c) => {
+          if (c.type === 'text') return renderFillBlankText(c.text, isHtmlEnabled);
+          if (c.type === 'select') {
+            const choices = (c.options || []).map((o) => wrapTagTextIfNeeded(cleanText(o).trim()));
+            return `[Выбор: ${choices.join(' / ')}]`;
+          }
+          return '[____]';
+        });
+        let templateText = '';
+        for (const p of parts) {
+          if (!p) continue;
+          if (!templateText || templateText.endsWith('\n') || p.startsWith('\n')) {
+            templateText += p;
+          } else {
+            templateText += ` ${p}`;
+          }
+        }
+        md += `${templateText.replace(/\n{2,}/g, '\n').trim()}\n\n`;
       } else {
-        md += `*Шаблон с пропусками не загружен (попытка ещё не создавалась).*\n\n`;
+        md += `*Шаблон с пропусками ${notLoadedReason}.*\n\n`;
+      }
+    }
+
+    if (type === 'html') {
+      const htmlTpl = cleanText(opts.html_template || '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, '');
+      const cssTpl = cleanText(opts.css_template || '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, '');
+      if (htmlTpl) {
+        md += `**Шаблон HTML:**\n${makeFence(htmlTpl, 'html')}\n\n`;
+      }
+      if (cssTpl) {
+        md += `**Шаблон CSS:**\n${makeFence(cssTpl, 'css')}\n\n`;
+      }
+      if (Array.isArray(opts.checklist) && opts.checklist.length) {
+        const items = opts.checklist
+          .map((item) => wrapTagTextIfNeeded(cleanText(item?.name || '').replace(/\s+/g, ' ').trim()))
+          .filter(Boolean);
+        if (items.length) {
+          md += `**Критерии проверки:**\n${items.map((x) => `* ${x}`).join('\n')}\n\n`;
+        }
       }
     }
 
@@ -848,13 +1163,18 @@
       const notes = [];
       if (opts.is_attachments_enabled) notes.push('допускаются вложения');
       md += `*Формат ответа: свободный ответ${notes.length ? ` (${notes.join(', ')})` : ''}*\n\n`;
+    } else if (type === 'dataset') {
+      const dsUrl = ds.dataset_url || opts.dataset_url;
+      md += dsUrl
+        ? `*Формат ответа: файл данных (${resolveStepikUrl(dsUrl)})*\n\n`
+        : `*Формат ответа: файл данных (dataset)*\n\n`;
     }
 
     if (type === 'code' || type === 'sql' || opts.limits || opts.execution_time_limit || opts.execution_memory_limit) {
       const limitEntries = opts.limits && typeof opts.limits === 'object' ? Object.entries(opts.limits) : [];
       if (limitEntries.length > 0 && limitEntries.length <= 5) {
         const formattedLimits = limitEntries
-          .map(([lang, lim]) => `${lang} (${lim.time ?? opts.execution_time_limit ?? '?'}с, ${lim.memory ?? opts.execution_memory_limit ?? '?'} МБ)`)
+          .map(([lang, lim]) => `${lang} (${lim?.time ?? opts.execution_time_limit ?? '?'}с, ${lim?.memory ?? opts.execution_memory_limit ?? '?'} МБ)`)
           .join('; ');
         md += `*Ограничения:* ${formattedLimits}\n\n`;
       } else if (limitEntries.length > 5) {
@@ -877,20 +1197,25 @@
     }
 
     if (Array.isArray(opts.samples) && opts.samples.length) {
-      md += `**Примеры:**\n`;
-      opts.samples.forEach(([inp, out], idx) => {
-        const cleanIn = cleanText(inp).replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
-        const cleanOut = cleanText(out).replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
-        const sampleBody = `Вход:\n${cleanIn || '(пусто)'}\nВыход:\n${cleanOut || '(пусто)'}`;
-        md += `*Тест ${idx + 1}:*\n${makeFence(sampleBody, 'text')}\n`;
-      });
-      md += '\n';
+      const validSamples = opts.samples.filter((s) => Array.isArray(s));
+      if (validSamples.length) {
+        md += `**Примеры:**\n`;
+        validSamples.forEach(([inp, out], idx) => {
+          const cleanIn = cleanText(inp).replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
+          const cleanOut = cleanText(out).replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
+          const sampleBody = `Вход:\n${cleanIn || '(пусто)'}\nВыход:\n${cleanOut || '(пусто)'}`;
+          md += `*Тест ${idx + 1}:*\n${makeFence(sampleBody, 'text')}\n`;
+        });
+        md += '\n';
+      }
     }
 
     const headerCounts = opts.code_templates_header_lines_count || {};
     const footerCounts = opts.code_templates_footer_lines_count || {};
     if (opts.code_templates && typeof opts.code_templates === 'object') {
       const hiddenMeta = [];
+      const groupedTemplates = new Map();
+
       for (const [lang, tpl] of Object.entries(opts.code_templates)) {
         const cleanedTpl = cleanText(tpl)
           .replace(/\r\n?/g, '\n')
@@ -901,13 +1226,22 @@
         if (hCount > 0) metaParts.push(`скрытый header: ${hCount} стр.`);
         if (fCount > 0) metaParts.push(`скрытый footer: ${fCount} стр.`);
 
-        if (cleanedTpl) {
+        if (cleanedTpl && !isGenericCodeStub(cleanedTpl)) {
           const fenceLang = normalizeLang(lang);
           const suffix = metaParts.length ? ` — ${metaParts.join(', ')}` : '';
-          md += `**Шаблон кода (${lang}${suffix}):**\n${makeFence(cleanedTpl, fenceLang)}\n\n`;
+          const groupKey = `${fenceLang}\u0000${suffix}\u0000${cleanedTpl}`;
+          if (!groupedTemplates.has(groupKey)) {
+            groupedTemplates.set(groupKey, { langs: [lang], fenceLang, suffix, code: cleanedTpl });
+          } else {
+            groupedTemplates.get(groupKey).langs.push(lang);
+          }
         } else if (metaParts.length) {
           hiddenMeta.push(`${lang}: ${metaParts.join(', ')}`);
         }
+      }
+
+      for (const item of groupedTemplates.values()) {
+        md += `**Шаблон кода (${item.langs.join(', ')}${item.suffix}):**\n${makeFence(item.code, item.fenceLang)}\n\n`;
       }
       if (hiddenMeta.length) {
         md += `*Скрытый код окружения:* ${hiddenMeta.join('; ')}\n\n`;
@@ -923,23 +1257,9 @@
     let courseId = null;
     let currentSectionId = null;
 
-    const courseMatch = window.location.pathname.match(/\/course\/(\d+)/);
+    const courseMatch = window.location.pathname.match(COURSE_PATH_RE);
     if (courseMatch) {
       return { courseId: courseMatch[1], currentSectionId: null };
-    }
-
-    const scopedSelectors = [
-      '.lesson-sidebar__course-title[href*="/course/"]',
-      '.lesson-sidebar a[href*="/course/"]',
-      'nav a[href*="/course/"]'
-    ];
-    for (const sel of scopedSelectors) {
-      const link = document.querySelector(sel);
-      const m = link?.getAttribute('href')?.match(/\/course\/(\d+)/);
-      if (m) {
-        courseId = m[1];
-        break;
-      }
     }
 
     const unitParam = new URLSearchParams(window.location.search).get('unit');
@@ -949,18 +1269,16 @@
         const sectionId = unitData.units?.[0]?.section;
         if (sectionId) {
           currentSectionId = sectionId;
-          if (!courseId) {
-            const secData = await fetchJsonWithRetry(`/api/sections/${sectionId}`, { signal });
-            const resolved = secData.sections?.[0]?.course;
-            if (resolved) courseId = String(resolved);
-          }
+          const secData = await fetchJsonWithRetry(`/api/sections/${sectionId}`, { signal });
+          const resolved = secData.sections?.[0]?.course;
+          if (resolved) courseId = String(resolved);
         }
       } catch (e) {
         if (e.name === 'AbortError') throw e;
       }
     }
 
-    const lessonMatch = window.location.pathname.match(/\/lesson\/(\d+)/);
+    const lessonMatch = window.location.pathname.match(LESSON_PATH_RE);
     if (lessonMatch && (!courseId || !currentSectionId)) {
       const lessonId = lessonMatch[1];
       try {
@@ -985,8 +1303,42 @@
       }
     }
 
+    if (!courseId) {
+      const scopedSelectors = [
+        '.lesson-sidebar__course-title[href*="/course/"]',
+        '.lesson-sidebar a[href*="/course/"]'
+      ];
+      for (const sel of scopedSelectors) {
+        const link = document.querySelector(sel);
+        const m = link?.getAttribute('href')?.match(COURSE_PATH_RE);
+        if (m) {
+          courseId = m[1];
+          break;
+        }
+      }
+    }
+
     if (!courseId) throw new Error('Could not resolve course ID');
     return { courseId, currentSectionId };
+  }
+
+  function raceWithAbort(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (val) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(val);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
+    });
   }
 
   async function fetchCourseSectionsCached(signal) {
@@ -1002,17 +1354,16 @@
     }
 
     if (modulesCache.loadingCourseId === courseId && modulesCache.loadingPromise) {
-      const loaded = await modulesCache.loadingPromise;
+      const loaded = await raceWithAbort(modulesCache.loadingPromise, signal);
       return { ...loaded, currentSectionId };
     }
 
     const loadPromise = (async () => {
-      const courseData = await fetchJsonWithRetry(`/api/courses/${courseId}`, { signal });
+      const courseData = await fetchJsonWithRetry(`/api/courses/${courseId}`);
       const course = courseData.courses?.[0];
       if (!course) throw new Error('Course not found');
 
       const sections = await fetchBatchedByIds('sections', 'sections', course.sections || [], {
-        signal,
         allowPartial: true
       });
       sections.sort((a, b) => a.position - b.position);
@@ -1028,7 +1379,7 @@
     modulesCache.loadingPromise = loadPromise;
 
     try {
-      const loaded = await loadPromise;
+      const loaded = await raceWithAbort(loadPromise, signal);
       return { ...loaded, currentSectionId };
     } finally {
       if (modulesCache.loadingPromise === loadPromise) {
@@ -1038,25 +1389,45 @@
     }
   }
 
-  async function buildLessonMarkdown() {
-    const match = window.location.pathname.match(/\/lesson\/(\d+)/);
+  async function buildLessonMarkdown({ onProgress, signal } = {}) {
+    const match = window.location.pathname.match(LESSON_PATH_RE);
     if (!match) throw new Error('Lesson ID not found in URL');
     const lessonId = match[1];
 
-    const dataLesson = await fetchJsonWithRetry(`/api/lessons/${lessonId}`);
+    const netOpts = {
+      signal,
+      onRateLimit: onProgress ? (sec) => onProgress(`Rate ${sec}s...`, 'warn') : undefined,
+      allowPartial: true
+    };
+
+    const dataLesson = await fetchJsonWithRetry(`/api/lessons/${lessonId}`, netOpts);
     const lesson = dataLesson.lessons?.[0];
     if (!lesson) throw new Error('Unable to load lesson metadata');
 
-    const allSteps = await fetchBatchedByIds('steps', 'steps', lesson.steps || [], { allowPartial: true });
+    const allSteps = await fetchBatchedByIds('steps', 'steps', lesson.steps || [], netOpts);
     allSteps.sort((a, b) => a.position - b.position);
 
     const datasets = new Map();
     const quizSteps = allSteps.filter(needsAttemptDataset);
+    let quizAbortedByRateLimit = false;
 
-    await runWithConcurrency(quizSteps, 3, async (s) => {
-      const ds = await fetchAttemptDataset(s.id);
-      if (ds) datasets.set(s.id, ds);
-    });
+    if (quizSteps.length > 0) {
+      await runWithConcurrency(
+        quizSteps,
+        3,
+        async (s) => {
+          if (quizAbortedByRateLimit) return;
+          try {
+            const ds = await fetchAttemptDataset(s.id, netOpts);
+            if (ds) datasets.set(s.id, ds);
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            if (e.status === 429) quizAbortedByRateLimit = true;
+          }
+        },
+        signal
+      );
+    }
 
     const courseTitle = document.querySelector('.lesson-sidebar__course-title')?.textContent?.trim();
     const lessonHeader = document.querySelector('.top-tools__lesson-name')?.textContent?.replace(/\s+/g, ' ').trim();
@@ -1067,7 +1438,10 @@
     md += '\n';
 
     for (const step of allSteps) {
-      md += renderStepMarkdown(step, datasets.get(step.id), 2);
+      const needsQuiz = needsAttemptDataset(step) && !datasets.has(step.id);
+      md += renderStepMarkdown(step, datasets.get(step.id), 2, {
+        quizAbortedByRateLimit: quizAbortedByRateLimit && needsQuiz
+      });
     }
 
     return {
@@ -1109,35 +1483,51 @@
     });
     const stepsMap = new Map(allSteps.map((s) => [s.id, s]));
 
-    // Strictly passive GET lookup for already-created quiz attempts
+    // Strictly passive GET lookup for already-created quiz attempts (with 429 circuit-breaker)
     const quizSteps = allSteps.filter(needsAttemptDataset);
     const datasets = new Map();
+    let quizAbortedByRateLimit = false;
     if (quizSteps.length > 0) {
       let doneQuizzes = 0;
       onProgress(`Quizzes 0/${quizSteps.length}...`, 'busy');
       await runWithConcurrency(
         quizSteps,
-        3,
+        2,
         async (s) => {
-          const ds = await fetchAttemptDataset(s.id, netOpts);
-          if (ds) datasets.set(s.id, ds);
+          if (quizAbortedByRateLimit) return;
+          try {
+            const ds = await fetchAttemptDataset(s.id, netOpts);
+            if (ds) datasets.set(s.id, ds);
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            if (e.status === 429) {
+              quizAbortedByRateLimit = true;
+              onProgress('Quizzes skipped (429)...', 'warn');
+              return;
+            }
+          }
           doneQuizzes++;
           if (doneQuizzes % 5 === 0 || doneQuizzes === quizSteps.length) {
             onProgress(`Quizzes ${doneQuizzes}/${quizSteps.length}...`, 'busy');
           }
-          await sleep(160, signal);
+          await sleep(180, signal);
         },
         signal
       );
     }
 
-    return { unitsBySection, lessonsMap, stepsMap, datasets };
+    return { unitsBySection, lessonsMap, stepsMap, datasets, quizAbortedByRateLimit };
   }
 
-  function renderSectionBlock(sec, sectionNum, { unitsBySection, lessonsMap, stepsMap, datasets }) {
+  function renderSectionBlock(
+    sec,
+    sectionNum,
+    { unitsBySection, lessonsMap, stepsMap, datasets, quizAbortedByRateLimit }
+  ) {
     const secTitle = cleanText(sec.title || `Модуль ${sectionNum}`).trim();
-    let tocLines = `* **Модуль ${sectionNum}. ${secTitle}**\n`;
-    let body = `## Модуль ${sectionNum}. ${secTitle}\n\n`;
+    const examBadge = sec.is_exam ? ' [Экзамен]' : '';
+    let tocLines = `* **Модуль ${sectionNum}. ${secTitle}${examBadge}**\n`;
+    let body = `## Модуль ${sectionNum}. ${secTitle}${examBadge}\n\n`;
     let exportedLessons = 0;
 
     const secUnits = unitsBySection.get(sec.id) || [];
@@ -1156,20 +1546,29 @@
       }
 
       const lessonTitle = cleanText(lesson.title || `Урок ${lesson.id}`).trim();
-      tocLines += `  * ${lessonNum} ${lessonTitle}\n`;
-      body += `### Урок ${lessonNum}. ${lessonTitle}\n\n`;
-      exportedLessons++;
-
       const lessonSteps = (lesson.steps || [])
         .map((id) => stepsMap.get(id))
         .filter(Boolean)
         .sort((a, b) => a.position - b.position);
 
+      if (!lessonSteps.length && lesson.is_public === false) {
+        tocLines += `  * ${lessonNum} ${lessonTitle} *[Закрыт]*\n`;
+        body += `### Урок ${lessonNum}. ${lessonTitle} [Закрыт]\n\n*Урок закрыт (требуется запись на курс или оплата).*\n\n`;
+        return;
+      }
+
+      tocLines += `  * ${lessonNum} ${lessonTitle}\n`;
+      body += `### Урок ${lessonNum}. ${lessonTitle}\n\n`;
+      exportedLessons++;
+
       if (!lessonSteps.length) {
         body += `*В уроке нет доступных шагов.*\n\n`;
       } else {
         for (const step of lessonSteps) {
-          body += renderStepMarkdown(step, datasets.get(step.id), 4);
+          const needsQuiz = needsAttemptDataset(step) && !datasets.has(step.id);
+          body += renderStepMarkdown(step, datasets.get(step.id), 4, {
+            quizAbortedByRateLimit: quizAbortedByRateLimit && needsQuiz
+          });
         }
       }
     });
@@ -1223,8 +1622,8 @@
 
   // --- Native Header Pill + Body-Portal Dropdown UI (Dual Shadow DOM, Zero Emojis) ---
 
-  const isLessonPage = () => /\/lesson\/\d+/.test(window.location.pathname);
-  const isCoursePage = () => /\/course\/\d+/.test(window.location.pathname);
+  const isLessonPage = () => LESSON_PATH_RE.test(window.location.pathname);
+  const isCoursePage = () => COURSE_PATH_RE.test(window.location.pathname);
   const isSupportedPage = () => isLessonPage() || isCoursePage();
 
   const PAGE_CSS = `
@@ -1413,6 +1812,8 @@
       transform-origin: top right;
       visibility: hidden;
       pointer-events: none;
+      max-height: calc(100vh - 64px);
+      overflow-y: auto;
       z-index: 2147483647;
       transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
     }
@@ -1613,10 +2014,14 @@
     const modBtn = ui.moduleBtn;
 
     const currentUrlKey = `${window.location.pathname}${window.location.search}`;
+    const routeCourseMatch = window.location.pathname.match(COURSE_PATH_RE);
+    const courseChanged = Boolean(routeCourseMatch && sel.dataset.courseId && sel.dataset.courseId !== routeCourseMatch[1]);
     const alreadyLoadedForPage =
+      !courseChanged &&
       sel.options.length > 0 &&
       sel.dataset.courseId &&
       sel.dataset.courseId === modulesCache.courseId &&
+      sel.dataset.urlKey === currentUrlKey &&
       !sel.disabled;
 
     if (!alreadyLoadedForPage) {
@@ -1651,9 +2056,11 @@
           const title = cleanText(sec.title || `Module ${idx + 1}`).trim();
           const suffix = !sec.units?.length
             ? ' (empty)'
-            : sec.is_active === false
+            : sec.is_active === false || sec.is_requirement_satisfied === false
               ? ' (locked)'
-              : '';
+              : sec.is_exam
+                ? ' (exam)'
+                : '';
           opt.textContent = `${idx + 1}. ${title}${suffix}`;
           sel.appendChild(opt);
         });
@@ -1661,6 +2068,8 @@
         sel.dataset.courseId = courseId;
         sel.disabled = false;
       }
+
+      sel.dataset.urlKey = currentUrlKey;
 
       if (currentSectionId && modulesCache.lastPreselectedLessonKey !== currentUrlKey) {
         const target = String(currentSectionId);
@@ -1866,12 +2275,19 @@
   async function handleCopyLesson() {
     if (!ui || isLessonBusy || !isLessonPage()) return;
     isLessonBusy = true;
+    if (lessonResetTimer) {
+      clearTimeout(lessonResetTimer);
+      lessonResetTimer = null;
+    }
     ui.copyBtn.disabled = true;
+    ui.dlBtn.disabled = true;
     ui.copyLabel.textContent = 'Copying...';
     setWidgetStatus('Copying...', 'busy');
 
     try {
-      const { md, count } = await buildLessonMarkdown();
+      const { md, count } = await buildLessonMarkdown({
+        onProgress: (msg, state) => setWidgetStatus(msg, state)
+      });
       await copyToClipboard(md);
       const doneText = `Copied (${count})`;
       ui.copyLabel.textContent = doneText;
@@ -1883,9 +2299,11 @@
       setWidgetStatus('Error', 'err', 2400);
     } finally {
       isLessonBusy = false;
-      setTimeout(() => {
-        if (ui) {
+      lessonResetTimer = setTimeout(() => {
+        lessonResetTimer = null;
+        if (ui && !isLessonBusy) {
           ui.copyBtn.disabled = false;
+          ui.dlBtn.disabled = false;
           ui.copyLabel.textContent = 'Copy Lesson';
         }
       }, 1800);
@@ -1895,12 +2313,19 @@
   async function handleDownloadLesson() {
     if (!ui || isLessonBusy || !isLessonPage()) return;
     isLessonBusy = true;
+    if (lessonResetTimer) {
+      clearTimeout(lessonResetTimer);
+      lessonResetTimer = null;
+    }
+    ui.copyBtn.disabled = true;
     ui.dlBtn.disabled = true;
     ui.dlLabel.textContent = 'Exporting...';
     setWidgetStatus('Exporting...', 'busy');
 
     try {
-      const { md, lessonId, title } = await buildLessonMarkdown();
+      const { md, lessonId, title } = await buildLessonMarkdown({
+        onProgress: (msg, state) => setWidgetStatus(msg, state)
+      });
       triggerDownload(md, `${sanitizeFilename(title, `lesson-${lessonId}`)}.md`);
       ui.dlLabel.textContent = 'Saved';
       setWidgetStatus('Saved', 'ok', 2200);
@@ -1911,8 +2336,10 @@
       setWidgetStatus('Error', 'err', 2400);
     } finally {
       isLessonBusy = false;
-      setTimeout(() => {
-        if (ui) {
+      lessonResetTimer = setTimeout(() => {
+        lessonResetTimer = null;
+        if (ui && !isLessonBusy) {
+          ui.copyBtn.disabled = false;
           ui.dlBtn.disabled = false;
           ui.dlLabel.textContent = 'Download Lesson (.md)';
         }
@@ -2277,6 +2704,15 @@
       if (ui?.isOpen) positionMenu();
     }, { passive: true, capture: true });
 
+    const isEditableTarget = (target) => {
+      const el = target instanceof Element ? target : document.activeElement;
+      if (!el) return false;
+      if (el.isContentEditable) return true;
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      return Boolean(el.closest('.cm-editor, .CodeMirror, .ace_editor'));
+    };
+
     document.addEventListener('keydown', (e) => {
       if (!isSupportedPage()) return;
       if (e.key === 'Escape' && ui?.isOpen) {
@@ -2284,6 +2720,7 @@
         return;
       }
       if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        if (isEditableTarget(e.target)) return;
         if (e.code === 'KeyM') {
           e.preventDefault();
           if (ui) setMenuOpen(!ui.isOpen);

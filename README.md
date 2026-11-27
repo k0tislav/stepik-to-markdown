@@ -2,7 +2,7 @@
 # Stepik to Markdown
 
 Скрипт/расширение для скачивания курсов со Stepik в формате Markdown (`.md`).
-Для скачивания можно выбрать сразу весь курс, конкретный модуль или урок. Комментарии не подтягиваются. Функционал в кнопке MD сверху справа.
+Для скачивания можно выбрать сразу весь курс, конкретный модуль или урок. Комментарии не подтягиваются. Функционал в кнопке MD сверху справа (или по горячим клавишам `Alt+M` — открыть меню, `Alt+C` — скопировать текущий урок).
 
 Смысл:
 Если скачать урок со Stepik в формате HTML и попробовать скормить его LLM-модели, например для обучения, то вскоре придётся столкнуться с закончившимися лимитами. Скачанный HTML содержит тонны мусора, скриптов, ненужных данных и т.д., которые высасывают все токены. Скрипт всё это вычищает оставляя чистый markdown, так хорошо понятный нейроночкам.
@@ -57,5 +57,5 @@ This tool strips away all unnecessary markup and leaves only pure, structured Ma
 * **40–60x smaller file size** compared to saved HTML pages.
 * **Flexible export:** Download a single lesson, a whole module, or an entire course at once.
 * **LLM-ready:** Clean formatting optimized for AI context windows and personal knowledge bases (Obsidian, Notion).
-* **Easy access:** Adds a convenient `MD` button right in the top-right header of any Stepik lesson page.
+* **Easy access:** Adds a convenient `MD` button right in the top-right header of any Stepik lesson page (`Alt+M` to open menu, `Alt+C` to copy current lesson).
 
