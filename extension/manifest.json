@@ -3,6 +3,11 @@
   "name": "Stepik Lesson to Markdown",
   "version": "2.1",
   "description": "Экспорт курсов и уроков Stepik в чистый и компактный Markdown для LLM (в буфер обмена или .md файл).",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "content_scripts": [
     {
       "matches": [
